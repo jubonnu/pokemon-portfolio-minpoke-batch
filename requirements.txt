@@ -1,0 +1,25 @@
+# Pokemon Card Scraping Batch
+# Python 3.11+
+
+# Async HTTP client
+aiohttp==3.9.1
+
+# Supabase client
+supabase==2.3.4
+
+# Data validation
+pydantic==2.5.3
+pydantic-settings==2.1.0
+
+# Environment variables
+python-dotenv==1.0.0
+
+# Retry logic
+tenacity==8.2.3
+
+# Progress bar
+tqdm==4.66.1
+
+# Logging
+structlog==23.2.0
+
