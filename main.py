@@ -46,12 +46,22 @@ async def process_card(
             pbar.write(f"⚠️ アイテム保存エラー: {wp_post.title} - {e}")
             return None, 0, 0, 0
 
+        # データ取得状況をログ出力（最初の5件のみ）
+        if not hasattr(process_card, '_debug_count'):
+            process_card._debug_count = 0
+        
+        if process_card._debug_count < 5:
+            pbar.write(f"🔍 デバッグ [{wp_post.title}]: price_info={price_info is not None}, chart_data={len(chart_data) if chart_data else 0}件, grading_info={grading_info is not None}")
+            process_card._debug_count += 1
+
         # 価格情報を保存
         price_count = 0
         if price_info:
             try:
                 await db.upsert_price_info(price_info, db_item_id)
                 price_count = 1
+                if process_card._debug_count <= 5:
+                    pbar.write(f"✅ 価格情報保存成功: {wp_post.title}")
             except Exception as e:
                 pbar.write(f"⚠️ 価格情報保存エラー: {wp_post.title} - {e}")
                 import traceback
@@ -72,6 +82,8 @@ async def process_card(
                     pbar.write(f"⚠️ チャートデータ保存エラー: {wp_post.title} (date: {chart.date}) - {e}")
                     import traceback
                     pbar.write(f"   詳細: {traceback.format_exc()}")
+            if process_card._debug_count <= 5 and chart_count > 0:
+                pbar.write(f"✅ チャートデータ保存成功: {wp_post.title} ({chart_count}件)")
         else:
             # デバッグ: チャートデータが取得できていない
             if card.id:  # item_idが存在する場合のみ
@@ -83,6 +95,8 @@ async def process_card(
             try:
                 await db.upsert_grading(grading_info, db_item_id)
                 grading_count = 1
+                if process_card._debug_count <= 5:
+                    pbar.write(f"✅ グレーディング情報保存成功: {wp_post.title}")
             except Exception as e:
                 pbar.write(f"⚠️ グレーディング情報保存エラー: {wp_post.title} - {e}")
                 import traceback
@@ -96,6 +110,8 @@ async def process_card(
 
     except Exception as e:
         pbar.write(f"❌ エラー: {wp_post.title} - {e}")
+        import traceback
+        pbar.write(f"   詳細: {traceback.format_exc()}")
         return None, 0, 0, 0
 
 
@@ -198,6 +214,13 @@ async def main():
                 print(f"  {table}: {count:,} 件")
             print(f"\n⏱️ 処理時間: {elapsed:.2f} 秒")
             print(f"📈 処理速度: {len(wp_posts) / elapsed:.2f} cards/sec")
+            
+            # データ取得率を計算
+            if total_items > 0:
+                print(f"\n📊 データ取得率:")
+                print(f"  価格情報: {total_prices}/{total_items} ({total_prices/total_items*100:.1f}%)")
+                print(f"  チャートデータ: {total_charts}/{total_items} ({total_charts/total_items*100:.1f}%)")
+                print(f"  グレーディング情報: {total_gradings}/{total_items} ({total_gradings/total_items*100:.1f}%)")
 
     finally:
         await db.close()

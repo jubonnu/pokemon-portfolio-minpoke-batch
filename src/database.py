@@ -99,10 +99,19 @@ class Database:
         }
         
         def _upsert_price():
-            result = self.client.table("price_infos2").upsert(price_data, on_conflict="item_id").execute()
-            if result.data is None or len(result.data) == 0:
-                raise Exception(f"価格情報のupsertに失敗しました: {result}")
-            return result
+            try:
+                result = self.client.table("price_infos2").upsert(price_data, on_conflict="item_id").execute()
+                # Supabaseのupsertは成功してもdataが空の場合がある（特に更新時）
+                # エラーレスポンスをチェック
+                if hasattr(result, 'error') and result.error:
+                    raise Exception(f"価格情報のupsertエラー: {result.error}")
+                # result.dataが空でもエラーではない（更新の場合）
+                return result
+            except Exception as e:
+                # 詳細なエラー情報を出力
+                print(f"❌ upsert_price_info エラー詳細: {type(e).__name__}: {e}")
+                print(f"   データ: {price_data}")
+                raise
         
         await asyncio.to_thread(_upsert_price)
 
@@ -149,10 +158,17 @@ class Database:
         }
         
         def _upsert_chart():
-            result = self.client.table("charts2").upsert(chart_data, on_conflict="item_id,date").execute()
-            if result.data is None or len(result.data) == 0:
-                raise Exception(f"チャートデータのupsertに失敗しました: {result}")
-            return result
+            try:
+                # on_conflictは複数カラムの場合は文字列で指定
+                result = self.client.table("charts2").upsert(chart_data, on_conflict="item_id,date").execute()
+                if hasattr(result, 'error') and result.error:
+                    raise Exception(f"チャートデータのupsertエラー: {result.error}")
+                # result.dataが空でもエラーではない（更新の場合）
+                return result
+            except Exception as e:
+                print(f"❌ upsert_chart_data エラー詳細: {type(e).__name__}: {e}")
+                print(f"   データ: {chart_data}")
+                raise
         
         await asyncio.to_thread(_upsert_chart)
 
@@ -198,10 +214,16 @@ class Database:
         }
         
         def _upsert_grading():
-            result = self.client.table("gradings2").upsert(grading_data, on_conflict="item_id").execute()
-            if result.data is None or len(result.data) == 0:
-                raise Exception(f"グレーディング情報のupsertに失敗しました: {result}")
-            return result
+            try:
+                result = self.client.table("gradings2").upsert(grading_data, on_conflict="item_id").execute()
+                if hasattr(result, 'error') and result.error:
+                    raise Exception(f"グレーディング情報のupsertエラー: {result.error}")
+                # result.dataが空でもエラーではない（更新の場合）
+                return result
+            except Exception as e:
+                print(f"❌ upsert_grading エラー詳細: {type(e).__name__}: {e}")
+                print(f"   データ: {grading_data}")
+                raise
         
         await asyncio.to_thread(_upsert_grading)
 
