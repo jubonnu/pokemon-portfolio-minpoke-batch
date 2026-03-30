@@ -71,19 +71,17 @@ async def process_card(
             if card.id:  # item_idが存在する場合のみ
                 pbar.write(f"⚠️ 価格情報が取得できませんでした: {wp_post.title} (item_id: {card.id})")
 
-        # チャートデータを保存
+        # チャートデータを保存（日次1リクエストだと並列でHTTPが飽和するためバッチupsert）
         chart_count = 0
         if chart_data:
-            for chart in chart_data:
-                try:
-                    await db.upsert_chart_data(chart, db_item_id)
-                    chart_count += 1
-                except Exception as e:
-                    pbar.write(f"⚠️ チャートデータ保存エラー: {wp_post.title} (date: {chart.date}) - {e}")
-                    import traceback
-                    pbar.write(f"   詳細: {traceback.format_exc()}")
-            if process_card._debug_count <= 5 and chart_count > 0:
-                pbar.write(f"✅ チャートデータ保存成功: {wp_post.title} ({chart_count}件)")
+            try:
+                chart_count = await db.upsert_charts_for_item(chart_data, db_item_id)
+                if process_card._debug_count <= 5 and chart_count > 0:
+                    pbar.write(f"✅ チャートデータ保存成功: {wp_post.title} ({chart_count}件)")
+            except Exception as e:
+                pbar.write(f"⚠️ チャートデータ保存エラー: {wp_post.title} - {e}")
+                import traceback
+                pbar.write(f"   詳細: {traceback.format_exc()}")
         else:
             # デバッグ: チャートデータが取得できていない
             if card.id:  # item_idが存在する場合のみ

@@ -34,6 +34,20 @@ class Settings(BaseSettings):
         default=100, description="WordPress APIのper_page"
     )
 
+    # Supabase 書き込み（PostgREST即時接続数を抑え、ReadError 等を減らす）
+    db_write_concurrency: int = Field(
+        default=6,
+        description="同時に飛ばすSupabase書き込みHTTPリクエストの上限",
+    )
+    db_max_retries: int = Field(
+        default=6,
+        description="Supabase書き込みが一過性エラーで失敗したときの最大再試行回数",
+    )
+    supabase_chart_batch_rows: int = Field(
+        default=250,
+        description="charts2のupsert時、1リクエストあたり最大行数",
+    )
+
     # Retry Settings
     max_retries: int = Field(default=3, description="最大リトライ回数")
     retry_delay: float = Field(default=1.0, description="リトライ遅延（秒）")

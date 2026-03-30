@@ -2,12 +2,40 @@
 
 import asyncio
 from datetime import datetime
-from typing import Optional, List, Tuple, Dict
+from typing import Optional, List, Tuple, Dict, Callable, TypeVar
 
+import httpx
 from supabase import create_client, Client
 
 from .config import settings
 from .models import CardItem, ChartData, GradingInfo, PriceInfo
+
+T = TypeVar("T")
+
+
+def _is_retryable_supabase_error(exc: BaseException) -> bool:
+    """httpx / ソケットの一過性エラー（並列過多・EAGAIN 等）なら True"""
+    if isinstance(
+        exc,
+        (
+            httpx.ReadError,
+            httpx.ConnectError,
+            httpx.RemoteProtocolError,
+            httpx.WriteError,
+            httpx.ConnectTimeout,
+            httpx.ReadTimeout,
+            httpx.PoolTimeout,
+        ),
+    ):
+        # Resource temporarily unavailable は ReadError 等として現れることが多い
+        return True
+    if isinstance(exc, TimeoutError):
+        return True
+    if isinstance(exc, OSError):
+        errno = getattr(exc, "errno", None)
+        if errno in (11, 35):  # EAGAIN, macOS EAGAIN
+            return True
+    return False
 
 
 class Database:
@@ -15,17 +43,35 @@ class Database:
 
     def __init__(self):
         self.client: Optional[Client] = None
+        self._write_sem = asyncio.Semaphore(settings.db_write_concurrency)
+
+    async def _run_supabase(self, fn: Callable[[], T]) -> T:
+        """同時書き込み数を制限し、一過性ネットワークエラーは指数バックオフで再試行"""
+        max_attempts = max(1, settings.db_max_retries)
+        async with self._write_sem:
+            last_exc: Optional[BaseException] = None
+            for attempt in range(max_attempts):
+                try:
+                    return await asyncio.to_thread(fn)
+                except BaseException as e:
+                    last_exc = e
+                    if not _is_retryable_supabase_error(e) or attempt >= max_attempts - 1:
+                        raise
+                    wait = settings.retry_delay * (2**attempt)
+                    await asyncio.sleep(wait)
+            assert last_exc is not None
+            raise last_exc
 
     async def connect(self):
         """Supabaseクライアントを初期化"""
         try:
             print(f"📡 Supabase接続中... ({settings.supabase_url})")
-            
+
             # Supabaseクライアントを作成（同期APIなので、スレッドで実行）
             self.client = await asyncio.to_thread(
                 create_client,
                 settings.supabase_url,
-                settings.supabase_key
+                settings.supabase_key,
             )
             print("✅ Supabase接続完了")
         except Exception as e:
@@ -42,12 +88,13 @@ class Database:
 
     async def upsert_item(self, item: CardItem) -> int:
         """アイテムをupsert（挿入または更新）してIDを返す"""
-        # nameで既存レコードを検索
+        assert self.client is not None
+
         def _search():
             return self.client.table("items2").select("id").eq("name", item.name).execute()
-        
-        existing_result = await asyncio.to_thread(_search)
-        
+
+        existing_result = await self._run_supabase(_search)
+
         item_data = {
             "name": item.name,
             "series": item.series,
@@ -58,22 +105,23 @@ class Database:
             "pv": item.pv,
             "updated_at": datetime.now().isoformat(),
         }
-        
+
         if existing_result.data and len(existing_result.data) > 0:
-            # 更新
             existing_id = existing_result.data[0]["id"]
+
             def _update():
                 return self.client.table("items2").update(item_data).eq("id", existing_id).execute()
-            await asyncio.to_thread(_update)
+
+            await self._run_supabase(_update)
             return existing_id
-        else:
-            # 挿入
-            def _insert():
-                return self.client.table("items2").insert(item_data).execute()
-            result = await asyncio.to_thread(_insert)
-            if result.data and len(result.data) > 0:
-                return result.data[0]["id"]
-            raise Exception("アイテムの挿入に失敗しました")
+
+        def _insert():
+            return self.client.table("items2").insert(item_data).execute()
+
+        result = await self._run_supabase(_insert)
+        if result.data and len(result.data) > 0:
+            return result.data[0]["id"]
+        raise Exception("アイテムの挿入に失敗しました")
 
     async def upsert_items_batch(self, items: List[CardItem]) -> Dict[str, int]:
         """アイテムをバッチでupsertし、name -> db_id のマッピングを返す"""
@@ -85,6 +133,7 @@ class Database:
 
     async def upsert_price_info(self, price_info: PriceInfo, db_item_id: int):
         """価格情報をupsert"""
+        assert self.client is not None
         price_data = {
             "item_id": db_item_id,
             "deal_count": price_info.deal_count,
@@ -97,31 +146,23 @@ class Database:
             "price_change7": price_info.price_change7,
             "price_change30": price_info.price_change30,
         }
-        
-        def _upsert_price():
-            try:
-                result = self.client.table("price_infos2").upsert(price_data, on_conflict="item_id").execute()
-                # Supabaseのupsertは成功してもdataが空の場合がある（特に更新時）
-                # エラーレスポンスをチェック
-                if hasattr(result, 'error') and result.error:
-                    raise Exception(f"価格情報のupsertエラー: {result.error}")
-                # result.dataが空でもエラーではない（更新の場合）
-                return result
-            except Exception as e:
-                # 詳細なエラー情報を出力
-                print(f"❌ upsert_price_info エラー詳細: {type(e).__name__}: {e}")
-                print(f"   データ: {price_data}")
-                raise
-        
-        await asyncio.to_thread(_upsert_price)
 
-    async def upsert_price_infos_batch(
-        self, price_infos: List[Tuple[PriceInfo, int]]
-    ):
+        def _upsert_price():
+            result = self.client.table("price_infos2").upsert(
+                price_data, on_conflict="item_id"
+            ).execute()
+            if hasattr(result, "error") and result.error:
+                raise Exception(f"価格情報のupsertエラー: {result.error}")
+            return result
+
+        await self._run_supabase(_upsert_price)
+
+    async def upsert_price_infos_batch(self, price_infos: List[Tuple[PriceInfo, int]]):
         """価格情報をバッチでupsert"""
         if not price_infos:
             return
-        
+        assert self.client is not None
+
         price_data_list = [
             {
                 "item_id": db_item_id,
@@ -137,50 +178,45 @@ class Database:
             }
             for pi, db_item_id in price_infos
         ]
-        
-        # Supabaseはバッチupsertをサポート
+
         def _upsert_prices():
-            return self.client.table("price_infos2").upsert(price_data_list, on_conflict="item_id").execute()
-        await asyncio.to_thread(_upsert_prices)
+            return self.client.table("price_infos2").upsert(
+                price_data_list, on_conflict="item_id"
+            ).execute()
+
+        await self._run_supabase(_upsert_prices)
 
     async def upsert_chart_data(self, chart: ChartData, db_item_id: int):
-        """チャートデータをupsert"""
-        # date型を文字列に変換
-        date_str = chart.date.isoformat() if hasattr(chart.date, 'isoformat') else str(chart.date)
-        
-        chart_data = {
-            "item_id": db_item_id,
-            "date": date_str,
-            "price1": chart.price1,
-            "price2": chart.price2,
-            "price3": chart.price3,
-            "volume": chart.volume,
-        }
-        
-        def _upsert_chart():
-            try:
-                # on_conflictは複数カラムの場合は文字列で指定
-                result = self.client.table("charts2").upsert(chart_data, on_conflict="item_id,date").execute()
-                if hasattr(result, 'error') and result.error:
-                    raise Exception(f"チャートデータのupsertエラー: {result.error}")
-                # result.dataが空でもエラーではない（更新の場合）
-                return result
-            except Exception as e:
-                print(f"❌ upsert_chart_data エラー詳細: {type(e).__name__}: {e}")
-                print(f"   データ: {chart_data}")
-                raise
-        
-        await asyncio.to_thread(_upsert_chart)
+        """チャートデータを1行upsert（大量投入時は upsert_charts_for_item を推奨）"""
+        await self.upsert_charts_for_item([chart], db_item_id)
+
+    async def upsert_charts_for_item(
+        self, charts: List[ChartData], db_item_id: int
+    ) -> int:
+        """1アイテム分のチャートをチャンク単位でバッチupsert。保存した行数を返す"""
+        if not charts:
+            return 0
+        chunk = max(1, settings.supabase_chart_batch_rows)
+        total = 0
+        for i in range(0, len(charts), chunk):
+            part = charts[i : i + chunk]
+            pairs = [(c, db_item_id) for c in part]
+            await self.upsert_charts_batch(pairs)
+            total += len(part)
+        return total
 
     async def upsert_charts_batch(self, charts: List[Tuple[ChartData, int]]):
         """チャートデータをバッチでupsert"""
         if not charts:
             return
-        
+        assert self.client is not None
+
         chart_data_list = [
             {
                 "item_id": db_item_id,
-                "date": chart.date.isoformat() if hasattr(chart.date, 'isoformat') else str(chart.date),
+                "date": chart.date.isoformat()
+                if hasattr(chart.date, "isoformat")
+                else str(chart.date),
                 "price1": chart.price1,
                 "price2": chart.price2,
                 "price3": chart.price3,
@@ -188,13 +224,20 @@ class Database:
             }
             for chart, db_item_id in charts
         ]
-        
+
         def _upsert_charts():
-            return self.client.table("charts2").upsert(chart_data_list, on_conflict="item_id,date").execute()
-        await asyncio.to_thread(_upsert_charts)
+            result = self.client.table("charts2").upsert(
+                chart_data_list, on_conflict="item_id,date"
+            ).execute()
+            if hasattr(result, "error") and result.error:
+                raise Exception(f"チャートデータのupsertエラー: {result.error}")
+            return result
+
+        await self._run_supabase(_upsert_charts)
 
     async def upsert_grading(self, grading: GradingInfo, db_item_id: int):
         """グレーディング情報をupsert"""
+        assert self.client is not None
         grading_data = {
             "item_id": db_item_id,
             "checked_at": grading.checked_at.isoformat() if grading.checked_at else None,
@@ -212,28 +255,30 @@ class Database:
             "grd_status_all": grading.grd_status_all,
             "grd_url": grading.grd_url,
         }
-        
+
         def _upsert_grading():
-            try:
-                result = self.client.table("gradings2").upsert(grading_data, on_conflict="item_id").execute()
-                if hasattr(result, 'error') and result.error:
-                    raise Exception(f"グレーディング情報のupsertエラー: {result.error}")
-                # result.dataが空でもエラーではない（更新の場合）
-                return result
-            except Exception as e:
-                print(f"❌ upsert_grading エラー詳細: {type(e).__name__}: {e}")
-                print(f"   データ: {grading_data}")
-                raise
-        
-        await asyncio.to_thread(_upsert_grading)
+            result = self.client.table("gradings2").upsert(
+                grading_data, on_conflict="item_id"
+            ).execute()
+            if hasattr(result, "error") and result.error:
+                raise Exception(f"グレーディング情報のupsertエラー: {result.error}")
+            return result
+
+        await self._run_supabase(_upsert_grading)
 
     async def get_stats(self) -> Dict:
         """テーブル統計を取得"""
+        assert self.client is not None
         stats = {}
         for table in ["items2", "price_infos2", "charts2", "gradings2"]:
+
             def _count(tbl=table):
                 return self.client.table(tbl).select("id", count="exact").execute()
-            result = await asyncio.to_thread(_count)
-            # Supabaseのcountはresult.countに含まれる
-            stats[table] = result.count if hasattr(result, 'count') else len(result.data) if result.data else 0
+
+            result = await self._run_supabase(_count)
+            stats[table] = (
+                result.count
+                if hasattr(result, "count")
+                else len(result.data) if result.data else 0
+            )
         return stats
