@@ -386,23 +386,58 @@ class PokecaAPIClient:
         return grading
 
     @staticmethod
-    def extract_series(name: str) -> Optional[str]:
+    def extract_set_code(title: str) -> Optional[str]:
         """
-        カード名からシリーズを抽出
+        カード名文字列からセットコードを推定（ブラケット内の先頭トークン）
         例: "メガリザードンYex [MC 766/742]" → "MC"
-        例: "ブラッキーex [sv8a 217/187]" → "sv8a"
         """
-        # パターン: [XXX 数字/数字] または [XXX]
-        match = re.search(r"\[([A-Za-z0-9]+)[\s\-]", name)
+        match = re.search(r"\[([A-Za-z0-9]+)[\s\-]", title)
         if match:
             return match.group(1)
-
-        # パターン: [XXX] （スペースなし）
-        match = re.search(r"\[([A-Za-z0-9]+)\]", name)
+        match = re.search(r"\[([A-Za-z0-9]+)\]", title)
         if match:
             return match.group(1)
-
         return None
+
+    @staticmethod
+    def parse_card_title(raw: str) -> Tuple[str, Optional[str], Optional[str]]:
+        """
+        API/WordPressのタイトルを表示用name・set_code・card_numberに分離する。
+        ブラケット内が「セットコード（任意の記号可） + 半角スペース + 012/221形式」
+        例: "メガゲッコウガex [M4 120/083]" -> ("メガゲッコウガex", "M4", "120/083")
+        例: "リーリエ [SM4+ 119/114]" -> ("リーリエ", "SM4+", "119/114")
+        """
+        s = (raw or "").strip()
+        if not s:
+            return "", None, None
+
+        m = re.match(r"^(?P<n>.+?)\s*\[\s*(?P<inner>[^\]]+?)\s*\]\s*$", s)
+        if m:
+            inner = m.group("inner").strip()
+            im = re.match(r"^(?P<set>.+?)\s+(?P<cn>\d+/\d+)$", inner)
+            if im:
+                return (
+                    m.group("n").strip(),
+                    im.group("set").strip(),
+                    im.group("cn"),
+                )
+
+        set_code: Optional[str] = None
+        card_number: Optional[str] = None
+        inner_m = re.search(r"\[([^\]]+)\]\s*$", s)
+        if inner_m:
+            inner = inner_m.group(1).strip()
+            pair = re.match(r"^(.+?)\s+(\d+/\d+)$", inner)
+            if pair:
+                set_code, card_number = pair.group(1).strip(), pair.group(2)
+
+        if set_code is None:
+            set_code = PokecaAPIClient.extract_set_code(s)
+
+        clean = re.sub(r"\s*\[[^\]]+\]\s*$", "", s).strip()
+        if not clean:
+            clean = s
+        return clean, set_code, card_number
 
     @staticmethod
     def _parse_price(value: Optional[str]) -> int:
@@ -470,12 +505,11 @@ async def fetch_card_details(
     price_info, transactions = price_result
 
     # カード名を決定（get-item-btn-link.phpから取得、なければWordPressから）
-    name = wp_post.title
+    raw_title = wp_post.title
     if item_btn_link and item_btn_link.get("name"):
-        name = item_btn_link["name"]
+        raw_title = item_btn_link["name"]
 
-    # シリーズを抽出
-    series = client.extract_series(name)
+    name, set_code, card_number = client.parse_card_title(raw_title)
 
     # 画像URLが取得できなかった場合はWordPress Media APIにフォールバック
     if not image_url:
@@ -486,7 +520,8 @@ async def fetch_card_details(
         wp_post_id=wp_post.id,
         slug=wp_post.slug,
         name=name,
-        series=series,
+        set_code=set_code,
+        card_number=card_number,
         tags=tags,
         transactions=transactions,
         image_url=image_url,

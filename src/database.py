@@ -1,6 +1,7 @@
 """データベース操作 - Supabaseクライアント使用"""
 
 import asyncio
+import threading
 from datetime import datetime
 from typing import Optional, List, Tuple, Dict, Callable, TypeVar
 
@@ -35,6 +36,11 @@ def _is_retryable_supabase_error(exc: BaseException) -> bool:
         errno = getattr(exc, "errno", None)
         if errno in (11, 35):  # EAGAIN, macOS EAGAIN
             return True
+    if isinstance(exc, RuntimeError):
+        msg = str(exc).lower()
+        if "deque mutated" in msg or "mutated during iteration" in msg:
+            # HTTP/2 hpack がマルチスレッド共有で壊れた場合のフォールバック用（通常はロックで防止）
+            return True
     return False
 
 
@@ -43,36 +49,42 @@ class Database:
 
     def __init__(self):
         self.client: Optional[Client] = None
-        self._write_sem = asyncio.Semaphore(settings.db_write_concurrency)
+        # 同期 Supabase / httpx は HTTP/2 の HPACK がスレッド非安全。
+        # to_thread で複数スレッドから同一 client を触ると deque mutated が起きるため直列化する。
+        self._client_lock = threading.Lock()
+
+    def _sync_with_lock(self, fn: Callable[[], T]) -> T:
+        with self._client_lock:
+            return fn()
 
     async def _run_supabase(self, fn: Callable[[], T]) -> T:
-        """同時書き込み数を制限し、一過性ネットワークエラーは指数バックオフで再試行"""
+        """Supabase 同期APIをスレッドで実行（ロックで直列化）。一過性エラーは再試行。"""
         max_attempts = max(1, settings.db_max_retries)
-        async with self._write_sem:
-            last_exc: Optional[BaseException] = None
-            for attempt in range(max_attempts):
-                try:
-                    return await asyncio.to_thread(fn)
-                except BaseException as e:
-                    last_exc = e
-                    if not _is_retryable_supabase_error(e) or attempt >= max_attempts - 1:
-                        raise
-                    wait = settings.retry_delay * (2**attempt)
-                    await asyncio.sleep(wait)
-            assert last_exc is not None
-            raise last_exc
+        last_exc: Optional[BaseException] = None
+        for attempt in range(max_attempts):
+            try:
+                return await asyncio.to_thread(self._sync_with_lock, fn)
+            except BaseException as e:
+                last_exc = e
+                if not _is_retryable_supabase_error(e) or attempt >= max_attempts - 1:
+                    raise
+                wait = settings.retry_delay * (2**attempt)
+                await asyncio.sleep(wait)
+        assert last_exc is not None
+        raise last_exc
 
     async def connect(self):
         """Supabaseクライアントを初期化"""
         try:
             print(f"📡 Supabase接続中... ({settings.supabase_url})")
 
-            # Supabaseクライアントを作成（同期APIなので、スレッドで実行）
-            self.client = await asyncio.to_thread(
-                create_client,
-                settings.supabase_url,
-                settings.supabase_key,
-            )
+            def _create() -> Client:
+                return create_client(
+                    settings.supabase_url,
+                    settings.supabase_key,
+                )
+
+            self.client = await asyncio.to_thread(self._sync_with_lock, _create)
             print("✅ Supabase接続完了")
         except Exception as e:
             print(f"❌ Supabase接続エラー: {e}")
@@ -87,17 +99,27 @@ class Database:
         print("Supabase接続終了")
 
     async def upsert_item(self, item: CardItem) -> int:
-        """アイテムをupsert（挿入または更新）してIDを返す"""
+        """アイテムをupsert（挿入または更新）してIDを返す（name + set_code + card_number で同一判定）"""
         assert self.client is not None
 
         def _search():
-            return self.client.table("items2").select("id").eq("name", item.name).execute()
+            q = self.client.table("items2").select("id").eq("name", item.name)
+            if item.set_code is not None:
+                q = q.eq("set_code", item.set_code)
+            else:
+                q = q.is_("set_code", None)
+            if item.card_number is not None:
+                q = q.eq("card_number", item.card_number)
+            else:
+                q = q.is_("card_number", None)
+            return q.execute()
 
         existing_result = await self._run_supabase(_search)
 
         item_data = {
             "name": item.name,
-            "series": item.series,
+            "set_code": item.set_code,
+            "card_number": item.card_number,
             "tags": item.tags,
             "transactions": item.transactions,
             "views": item.views,
@@ -124,12 +146,13 @@ class Database:
         raise Exception("アイテムの挿入に失敗しました")
 
     async def upsert_items_batch(self, items: List[CardItem]) -> Dict[str, int]:
-        """アイテムをバッチでupsertし、name -> db_id のマッピングを返す"""
-        name_to_id = {}
+        """アイテムをバッチでupsertし、(name,set_code,card_number) キー文字列 -> db_id を返す"""
+        key_to_id: Dict[str, int] = {}
         for item in items:
             db_id = await self.upsert_item(item)
-            name_to_id[item.name] = db_id
-        return name_to_id
+            key = f"{item.name}\x1f{item.set_code or ''}\x1f{item.card_number or ''}"
+            key_to_id[key] = db_id
+        return key_to_id
 
     async def upsert_price_info(self, price_info: PriceInfo, db_item_id: int):
         """価格情報をupsert"""

@@ -61,7 +61,8 @@ PostgreSQLに接続して以下のSQLを実行：
 CREATE TABLE public.items2 (
   id bigserial NOT NULL,
   name text NOT NULL,
-  series text NULL,
+  set_code text NULL,
+  card_number text NULL,
   tags text[] NULL,
   transactions integer NULL DEFAULT 0,
   views integer NULL DEFAULT 0,
@@ -73,6 +74,7 @@ CREATE TABLE public.items2 (
 );
 
 CREATE INDEX idx_items2_updated_at ON public.items2 USING btree (updated_at);
+CREATE INDEX idx_items2_name_set_card ON public.items2 USING btree (name, set_code, card_number);
 
 -- price_infos2テーブル
 CREATE TABLE public.price_infos2 (
@@ -217,8 +219,9 @@ pokemon-portfolio-minpoke-batch/
 ## 取得データの詳細
 
 ### items2テーブル
-- ✅ name: カード名
-- ✅ series: シリーズ（カード名から自動抽出）
+- ✅ name: カード名（括弧書きより前のみ、例: メガゲッコウガex）
+- ✅ set_code: セットコード（例: M4, MC, sv8a）
+- ✅ card_number: コレクターナンバー（例: 120/083）
 - ✅ tags: タグ（WordPressカテゴリ）
 - ✅ transactions: 取引数（cnt_0 + cnt_1 + cnt_2）
 - ✅ image_url: 画像URL

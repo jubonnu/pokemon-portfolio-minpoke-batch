@@ -34,10 +34,10 @@ class Settings(BaseSettings):
         default=100, description="WordPress APIのper_page"
     )
 
-    # Supabase 書き込み（PostgREST即時接続数を抑え、ReadError 等を減らす）
+    # 互換用（旧セマフォ設定）。現在は Database 内の threading.Lock で Supabase を直列化するため未使用。
     db_write_concurrency: int = Field(
         default=6,
-        description="同時に飛ばすSupabase書き込みHTTPリクエストの上限",
+        description="互換のため残置（未使用）",
     )
     db_max_retries: int = Field(
         default=6,

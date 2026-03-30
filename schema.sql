@@ -11,7 +11,8 @@ $$ LANGUAGE plpgsql;
 CREATE TABLE IF NOT EXISTS public.items2 (
   id bigserial NOT NULL,
   name text NOT NULL,
-  series text NULL,
+  set_code text NULL,
+  card_number text NULL,
   tags text[] NULL,
   transactions integer NULL DEFAULT 0,
   views integer NULL DEFAULT 0,
@@ -23,6 +24,7 @@ CREATE TABLE IF NOT EXISTS public.items2 (
 ) TABLESPACE pg_default;
 
 CREATE INDEX IF NOT EXISTS idx_items2_updated_at ON public.items2 USING btree (updated_at) TABLESPACE pg_default;
+CREATE INDEX IF NOT EXISTS idx_items2_name_set_card ON public.items2 USING btree (name, set_code, card_number) TABLESPACE pg_default;
 
 -- トリガーが既に存在する場合は削除してから再作成
 DROP TRIGGER IF EXISTS update_items2_updated_at ON public.items2;

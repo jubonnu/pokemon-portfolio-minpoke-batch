@@ -13,7 +13,8 @@ class CardItem:
     wp_post_id: int = 0  # WordPress post ID
     slug: str = ""
     name: str = ""
-    series: Optional[str] = None
+    set_code: Optional[str] = None
+    card_number: Optional[str] = None
     tags: List[str] = field(default_factory=list)
     transactions: int = 0
     views: int = 0
